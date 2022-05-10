@@ -7,6 +7,10 @@ import (
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/caddyauth"
 	"go.uber.org/zap"
 	"tailscale.com/client/tailscale"
@@ -14,10 +18,18 @@ import (
 
 func init() {
 	caddy.RegisterModule(TailscaleAuth{})
+	httpcaddyfile.RegisterHandlerDirective("tailscaleauth", parseCaddyfile)
 }
 
+const (
+	PolicyAllow = "allow"
+	PolicyDeny  = "deny"
+)
+
 type TailscaleAuth struct {
-	ExpectedTailnet string `json:"expected_tailnet,omitempty"`
+	ExpectedTailnet string            `json:"expected_tailnet,omitempty"`
+	DefaultPolicy   string            `json:"default_policy,omitempty"`
+	Policies        map[string]string `json:"policies,omitempty"`
 
 	logger *zap.Logger
 }
@@ -32,6 +44,7 @@ func (TailscaleAuth) CaddyModule() caddy.ModuleInfo {
 
 func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 	ta.logger = ctx.Logger(ta)
+	return nil
 }
 
 func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.User, bool, error) {
@@ -71,20 +84,103 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 		return caddyauth.User{}, false, nil
 	}
 
+	allow := ta.DefaultPolicy == PolicyAllow
+	for login, policy := range ta.Policies {
+		if login == info.UserProfile.LoginName {
+			if policy == PolicyAllow {
+				allow = true
+			} else if policy == PolicyDeny {
+				allow = false
+			}
+			break
+		}
+	}
+	if !allow {
+		return caddyauth.User{}, false, nil
+	}
+
 	user := caddyauth.User{
 		ID: info.UserProfile.LoginName,
 		Metadata: map[string]string{
-			"login":           strings.Split(info.UserProfile.LoginName, "@")[0],
+			"login":           info.UserProfile.LoginName,
 			"name":            info.UserProfile.DisplayName,
 			"profile_pic_url": info.UserProfile.ProfilePicURL,
 			"tailnet":         tailnet,
+			"node_name":       info.Node.Name,
 		},
 	}
 	return user, true, nil
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+func (ta *TailscaleAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if !d.Args(&ta.ExpectedTailnet) {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
+// parseCaddyfile sets up the handler from Caddyfile tokens. Syntax:
+//
+//     tailscaleauth [<expected_tailnet>] [<default policy allow|deny>] {
+//         <policy> <login>
+//     }
+//
+// If no hash algorithm is supplied, bcrypt will be assumed.
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	ta := TailscaleAuth{
+		DefaultPolicy: PolicyAllow,
+		Policies:      make(map[string]string),
+	}
+	for h.Next() {
+		args := h.RemainingArgs()
+
+		switch len(args) {
+		case 0:
+		case 1:
+			ta.ExpectedTailnet = args[0]
+		case 2:
+			ta.ExpectedTailnet = args[0]
+			switch args[1] {
+			case PolicyAllow, PolicyDeny:
+				ta.DefaultPolicy = args[1]
+			default:
+				return nil, h.Errf("unknown policy: %s", args[1])
+			}
+		default:
+			return nil, h.ArgErr()
+		}
+
+		for h.NextBlock(0) {
+			policy := h.Val()
+			var name string
+			if !h.Args(&name) {
+				return nil, h.Err("policy and name required")
+			}
+			if policy == "" || name == "" {
+				return nil, h.Err("policy and name cannot be empty or missing")
+			}
+			switch policy {
+			case PolicyAllow, PolicyDeny:
+			default:
+				return nil, h.Errf("unknown policy: %s", policy)
+			}
+			ta.Policies[name] = policy
+		}
+	}
+
+	return caddyauth.Authentication{
+		ProvidersRaw: caddy.ModuleMap{
+			"tailscale": caddyconfig.JSON(ta, nil),
+		},
+	}, nil
 }
 
 // Interface guards
 var (
 	_ caddy.Provisioner       = (*TailscaleAuth)(nil)
 	_ caddyauth.Authenticator = (*TailscaleAuth)(nil)
+	_ caddyfile.Unmarshaler   = (*TailscaleAuth)(nil)
 )
