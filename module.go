@@ -1,10 +1,13 @@
 package caddytailscaleauth
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
@@ -16,26 +19,53 @@ import (
 	"tailscale.com/client/tailscale"
 )
 
+const defaultTailscaleAPIRefreshInterval = time.Minute * 15
+
+const (
+	globalKeyTailscaleAPIKey             = "tailscale_api_key"
+	globalKeyTailscaleAPIRefreshInterval = "tailscale_api_refresh_interval"
+)
+
 func init() {
-	caddy.RegisterModule(TailscaleAuth{})
+	caddy.RegisterModule(&TailscaleAuth{})
 	httpcaddyfile.RegisterHandlerDirective("tailscaleauth", parseCaddyfile)
+	httpcaddyfile.RegisterGlobalOption(globalKeyTailscaleAPIKey, parseSimpleValue)
+	httpcaddyfile.RegisterGlobalOption(globalKeyTailscaleAPIRefreshInterval, parseDurationValue)
+	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 }
+
+const (
+	groupPrefix = "group:"
+	tagPrefix   = "tag:"
+)
 
 const (
 	PolicyAllow = "allow"
 	PolicyDeny  = "deny"
 )
 
-type TailscaleAuth struct {
-	ExpectedTailnet string            `json:"expected_tailnet,omitempty"`
-	DefaultPolicy   string            `json:"default_policy,omitempty"`
-	Policies        map[string]string `json:"policies,omitempty"`
+type PolicyMatches struct {
+	Policy  string
+	Matches []string
+}
 
-	logger *zap.Logger
+type TailscaleAuth struct {
+	ExpectedTailnet             string          `json:"expected_tailnet,omitempty"`
+	DefaultPolicy               string          `json:"default_policy,omitempty"`
+	Policies                    []PolicyMatches `json:"policies,omitempty"`
+	TailscaleAPIKey             string          `json:"tailscale_api_key,omitempty"`
+	TailscaleAPIRefreshInterval time.Duration   `json:"tailscale_api_refresh_interval,omitempty"`
+
+	logger         *zap.Logger
+	tc             *tailscale.Client
+	needGroup      bool
+	mu             sync.RWMutex
+	groupFetchTime time.Time
+	groups         map[string][]string // {"group:name": []{"login@tailnet"}}
 }
 
 // CaddyModule returns the Caddy module information.
-func (TailscaleAuth) CaddyModule() caddy.ModuleInfo {
+func (*TailscaleAuth) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.authentication.providers.tailscale",
 		New: func() caddy.Module { return new(TailscaleAuth) },
@@ -44,7 +74,55 @@ func (TailscaleAuth) CaddyModule() caddy.ModuleInfo {
 
 func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 	ta.logger = ctx.Logger(ta)
+	if ta.TailscaleAPIKey != "" {
+		ta.tc = tailscale.NewClient(ta.ExpectedTailnet, tailscale.APIKey(ta.TailscaleAPIKey))
+		if _, err := ta.userGroups(ctx); err != nil {
+			return err
+		}
+	}
+	for _, p := range ta.Policies {
+		for _, m := range p.Matches {
+			if strings.HasPrefix(m, groupPrefix) {
+				ta.needGroup = true
+				break
+			}
+		}
+		if ta.needGroup {
+			break
+		}
+	}
 	return nil
+}
+
+func (ta *TailscaleAuth) userGroups(ctx context.Context) (map[string][]string, error) {
+	if ta.tc == nil {
+		return nil, nil
+	}
+
+	now := time.Now()
+
+	ta.mu.RLock()
+	groups := ta.groups
+	lastFetch := ta.groupFetchTime
+	ta.mu.RUnlock()
+	if now.Sub(lastFetch) < ta.TailscaleAPIRefreshInterval {
+		return groups, nil
+	}
+
+	ta.mu.Lock()
+	defer ta.mu.Unlock()
+	// Recheck since we may have been waiting on this lock.
+	if time.Since(lastFetch) < ta.TailscaleAPIRefreshInterval {
+		return ta.groups, nil
+	}
+	// Update the time ever if we get an error to rate limit the lookups
+	ta.groupFetchTime = now
+	acl, err := ta.tc.ACL(ctx)
+	if err != nil {
+		return groups, err
+	}
+	ta.groups = acl.ACL.Groups
+	return ta.groups, nil
 }
 
 func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.User, bool, error) {
@@ -63,11 +141,6 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 		return caddyauth.User{}, false, fmt.Errorf("tailscale whois failed: %w", err)
 	}
 
-	if len(info.Node.Tags) != 0 {
-		ta.logger.Warn("node is tagged", zap.String("hostname", info.Node.Hostinfo.Hostname()))
-		return caddyauth.User{}, false, nil
-	}
-
 	_, tailnet, ok := strings.Cut(info.Node.Name, info.Node.ComputedName+".")
 	if !ok {
 		ta.logger.Error("can't extract tailnet name from hostname", zap.String("hostname", info.Node.Name))
@@ -84,17 +157,61 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 		return caddyauth.User{}, false, nil
 	}
 
+	var groups map[string][]string
+	if ta.needGroup {
+		groups, err = ta.userGroups(r.Context())
+		if err != nil {
+			ta.logger.Error("failed to fetch Tailscale user groups", zap.Error(err))
+		}
+	}
 	allow := ta.DefaultPolicy == PolicyAllow
-	for login, policy := range ta.Policies {
-		if login == info.UserProfile.LoginName {
-			if policy == PolicyAllow {
+	for _, p := range ta.Policies {
+		matchAll := true
+		for _, m := range p.Matches {
+			switch {
+			case strings.HasPrefix(m, groupPrefix):
+				var isMember bool
+				for _, gm := range groups[m] {
+					if gm == info.UserProfile.LoginName {
+						isMember = true
+						break
+					}
+				}
+				if !isMember {
+					matchAll = false
+				}
+			case strings.HasPrefix(m, tagPrefix):
+				var hasTag bool
+				for _, t := range info.Node.Tags {
+					if t == m {
+						hasTag = true
+						break
+					}
+				}
+				if !hasTag {
+					matchAll = false
+				}
+			case strings.Contains(m, "@"):
+				if m != info.UserProfile.LoginName {
+					matchAll = false
+				}
+			default:
+				matchAll = false
+			}
+			if !matchAll {
+				break
+			}
+		}
+		if matchAll {
+			if p.Policy == PolicyAllow {
 				allow = true
-			} else if policy == PolicyDeny {
+			} else if p.Policy == PolicyDeny {
 				allow = false
 			}
 			break
 		}
 	}
+
 	if !allow {
 		return caddyauth.User{}, false, nil
 	}
@@ -107,8 +224,10 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 			"profile_pic_url": info.UserProfile.ProfilePicURL,
 			"tailnet":         tailnet,
 			"node_name":       info.Node.Name,
+			"node_tags":       strings.Join(info.Node.Tags, ","),
 		},
 	}
+	ta.logger.Debug("tailscale auth successful", zap.Any("user", user))
 	return user, true, nil
 }
 
@@ -126,13 +245,18 @@ func (ta *TailscaleAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //
 //     tailscaleauth [<expected_tailnet>] [<default policy allow|deny>] {
 //         <policy> <login>
+//         <policy> tag:<tag> tag:<tag>
+//         <policy> group:<group>
 //     }
 //
-// If no hash algorithm is supplied, bcrypt will be assumed.
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	ta := TailscaleAuth{
 		DefaultPolicy: PolicyAllow,
-		Policies:      make(map[string]string),
+	}
+	ta.TailscaleAPIKey, _ = h.Option(globalKeyTailscaleAPIKey).(string)
+	ta.TailscaleAPIRefreshInterval, _ = h.Option(globalKeyTailscaleAPIRefreshInterval).(time.Duration)
+	if ta.TailscaleAPIRefreshInterval == 0 {
+		ta.TailscaleAPIRefreshInterval = defaultTailscaleAPIRefreshInterval
 	}
 	for h.Next() {
 		args := h.RemainingArgs()
@@ -155,19 +279,29 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 		for h.NextBlock(0) {
 			policy := h.Val()
-			var name string
-			if !h.Args(&name) {
-				return nil, h.Err("policy and name required")
+			if policy == "" {
+				return nil, h.Err("policy cannot be empty or is missing")
 			}
-			if policy == "" || name == "" {
-				return nil, h.Err("policy and name cannot be empty or missing")
+			var matches []string
+			for h.NextArg() {
+				name := h.Val()
+				if name == "" {
+					break
+				}
+				matches = append(matches, name)
+			}
+			if len(matches) == 0 {
+				return nil, h.Err("name or tags required")
 			}
 			switch policy {
 			case PolicyAllow, PolicyDeny:
 			default:
 				return nil, h.Errf("unknown policy: %s", policy)
 			}
-			ta.Policies[name] = policy
+			ta.Policies = append(ta.Policies, PolicyMatches{
+				Policy:  policy,
+				Matches: matches,
+			})
 		}
 	}
 
@@ -176,6 +310,34 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			"tailscale": caddyconfig.JSON(ta, nil),
 		},
 	}, nil
+}
+
+func parseSimpleValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	d.Next() // consume parameter name
+	if !d.Next() {
+		return "", d.ArgErr()
+	}
+	val := d.Val()
+	if d.Next() {
+		return "", d.ArgErr()
+	}
+	return val, nil
+}
+
+func parseDurationValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	d.Next() // consume parameter name
+	if !d.Next() {
+		return "", d.ArgErr()
+	}
+	val := d.Val()
+	if d.Next() {
+		return "", d.ArgErr()
+	}
+	dur, err := time.ParseDuration(val)
+	if err != nil {
+		return "", d.Errf("%q is not a valid duration: %s", err)
+	}
+	return dur, nil
 }
 
 // Interface guards
