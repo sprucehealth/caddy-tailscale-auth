@@ -24,6 +24,7 @@ const defaultTailscaleAPIRefreshInterval = time.Minute * 15
 const (
 	globalKeyTailscaleAPIKey             = "tailscale_api_key"
 	globalKeyTailscaleAPIRefreshInterval = "tailscale_api_refresh_interval"
+	globalKeyTailscaleGroups             = "tailscale_groups"
 )
 
 func init() {
@@ -31,6 +32,7 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("tailscaleauth", parseCaddyfile)
 	httpcaddyfile.RegisterGlobalOption(globalKeyTailscaleAPIKey, parseSimpleValue)
 	httpcaddyfile.RegisterGlobalOption(globalKeyTailscaleAPIRefreshInterval, parseDurationValue)
+	httpcaddyfile.RegisterGlobalOption(globalKeyTailscaleGroups, parseGroups)
 	tailscale.I_Acknowledge_This_API_Is_Unstable = true
 }
 
@@ -50,11 +52,12 @@ type PolicyMatches struct {
 }
 
 type TailscaleAuth struct {
-	ExpectedTailnet             string          `json:"expected_tailnet,omitempty"`
-	DefaultPolicy               string          `json:"default_policy,omitempty"`
-	Policies                    []PolicyMatches `json:"policies,omitempty"`
-	TailscaleAPIKey             string          `json:"tailscale_api_key,omitempty"`
-	TailscaleAPIRefreshInterval time.Duration   `json:"tailscale_api_refresh_interval,omitempty"`
+	ExpectedTailnet             string              `json:"expected_tailnet,omitempty"`
+	DefaultPolicy               string              `json:"default_policy,omitempty"`
+	Policies                    []PolicyMatches     `json:"policies,omitempty"`
+	Groups                      map[string][]string `json:"groups,omitempty"`
+	TailscaleAPIKey             string              `json:"tailscale_api_key,omitempty"`
+	TailscaleAPIRefreshInterval time.Duration       `json:"tailscale_api_refresh_interval,omitempty"`
 
 	logger         *zap.Logger
 	tc             *tailscale.Client
@@ -95,6 +98,9 @@ func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 }
 
 func (ta *TailscaleAuth) userGroups(ctx context.Context) (map[string][]string, error) {
+	if len(ta.Groups) != 0 {
+		return ta.Groups, nil
+	}
 	if ta.tc == nil {
 		return nil, nil
 	}
@@ -258,6 +264,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	if ta.TailscaleAPIRefreshInterval == 0 {
 		ta.TailscaleAPIRefreshInterval = defaultTailscaleAPIRefreshInterval
 	}
+	ta.Groups, _ = h.Option(globalKeyTailscaleGroups).(map[string][]string)
 	for h.Next() {
 		args := h.RemainingArgs()
 
@@ -307,7 +314,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 
 	return caddyauth.Authentication{
 		ProvidersRaw: caddy.ModuleMap{
-			"tailscale": caddyconfig.JSON(ta, nil),
+			"tailscale": caddyconfig.JSON(&ta, nil),
 		},
 	}, nil
 }
@@ -338,6 +345,26 @@ func parseDurationValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, err
 		return "", d.Errf("%q is not a valid duration: %s", err)
 	}
 	return dur, nil
+}
+
+func parseGroups(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+	groups := make(map[string][]string)
+	for d.Next() {
+		for d.NextBlock(0) {
+			groupName := d.Val()
+			if groupName == "" {
+				return nil, d.Err("tailscale group name missing")
+			}
+			for d.NextBlock(1) {
+				member := d.Val()
+				if member == "" {
+					return nil, d.Err("tailscale group member missing")
+				}
+				groups[groupName] = append(groups[groupName], member)
+			}
+		}
+	}
+	return groups, nil
 }
 
 // Interface guards
