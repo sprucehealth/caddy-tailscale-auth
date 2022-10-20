@@ -152,7 +152,7 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 		ta.logger.Error("can't extract tailnet name from hostname", zap.String("hostname", info.Node.Name))
 		return caddyauth.User{}, false, nil
 	}
-	tailnet, _, ok = strings.Cut(tailnet, ".beta.tailscale.net")
+	tailnet, _, ok = strings.Cut(tailnet, ".ts.net")
 	if !ok {
 		ta.logger.Error("can't extract tailnet name from hostname", zap.String("hostname", info.Node.Name))
 		return caddyauth.User{}, false, nil
@@ -249,12 +249,11 @@ func (ta *TailscaleAuth) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // parseCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
-//     tailscaleauth [<expected_tailnet>] [<default policy allow|deny>] {
-//         <policy> <login>
-//         <policy> tag:<tag> tag:<tag>
-//         <policy> group:<group>
-//     }
-//
+//	tailscaleauth [<expected_tailnet>] [<default policy allow|deny>] {
+//	    <policy> <login>
+//	    <policy> tag:<tag> tag:<tag>
+//	    <policy> group:<group>
+//	}
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	ta := TailscaleAuth{
 		DefaultPolicy: PolicyAllow,
