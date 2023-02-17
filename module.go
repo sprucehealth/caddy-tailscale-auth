@@ -84,6 +84,17 @@ func (*TailscaleAuth) CaddyModule() caddy.ModuleInfo {
 
 func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 	ta.logger = ctx.Logger(ta)
+	for _, p := range ta.Policies {
+		for _, m := range p.Matches {
+			if strings.HasPrefix(m, groupPrefix) {
+				ta.needGroup = true
+				break
+			}
+		}
+		if ta.needGroup {
+			break
+		}
+	}
 	if ta.TailscaleOAuthClientID != "" {
 		tailnet := ta.APITailnet
 		if tailnet == "" {
@@ -97,21 +108,40 @@ func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 		httpClient := oauthConfig.Client(ctx)
 		ta.tc = tailscale.NewClient(tailnet, nil)
 		ta.tc.HTTPClient = httpClient
-		if _, err := ta.userGroups(ctx); err != nil {
-			return err
-		}
-	}
-	for _, p := range ta.Policies {
-		for _, m := range p.Matches {
-			if strings.HasPrefix(m, groupPrefix) {
-				ta.needGroup = true
-				break
+		// If groups are not static then start a processes to periodically
+		// fetch the groups from the ACL.
+		if len(ta.Groups) == 0 && ta.needGroup {
+			if err := ta.refreshGroupsFromACL(ctx); err != nil {
+				return err
 			}
-		}
-		if ta.needGroup {
-			break
+			go func() {
+				t := time.NewTicker(ta.TailscaleAPIRefreshInterval)
+				for range t.C {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+					err := ta.refreshGroupsFromACL(ctx)
+					cancel()
+					if err != nil {
+						ta.logger.Error("failed to fetch Tailscale ACL", zap.Error(err))
+					}
+				}
+			}()
 		}
 	}
+	return nil
+}
+
+// refreshGroupsFromACL fetches a list of groups from the Tailscale ACL.
+func (ta *TailscaleAuth) refreshGroupsFromACL(ctx context.Context) error {
+	acl, err := ta.tc.ACL(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query Tailscale ACLs: %w", err)
+	}
+
+	ta.mu.Lock()
+	defer ta.mu.Unlock()
+	ta.groupFetchTime = time.Now()
+	ta.groups = acl.ACL.Groups
+	ta.logger.Debug("fetched tailscale groups", zap.Any("groups", ta.groups))
 	return nil
 }
 
@@ -123,31 +153,10 @@ func (ta *TailscaleAuth) userGroups(ctx context.Context) (map[string][]string, e
 		return nil, nil
 	}
 
-	now := time.Now()
-
 	ta.mu.RLock()
 	groups := ta.groups
-	lastFetch := ta.groupFetchTime
 	ta.mu.RUnlock()
-	if dt := now.Sub(lastFetch); dt < ta.TailscaleAPIRefreshInterval {
-		return groups, nil
-	}
-
-	ta.mu.Lock()
-	defer ta.mu.Unlock()
-	// Recheck since we may have been waiting on this lock.
-	if time.Since(lastFetch) < ta.TailscaleAPIRefreshInterval {
-		return ta.groups, nil
-	}
-	// Update the time ever if we get an error to rate limit the lookups
-	ta.groupFetchTime = now
-	acl, err := ta.tc.ACL(ctx)
-	if err != nil {
-		return groups, fmt.Errorf("failed to query Tailscale ACLs: %w", err)
-	}
-	ta.groups = acl.ACL.Groups
-	ta.logger.Debug("fetched tailscale groups", zap.Any("groups", ta.groups))
-	return ta.groups, nil
+	return groups, nil
 }
 
 func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.User, bool, error) {
