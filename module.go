@@ -67,6 +67,7 @@ type TailscaleAuth struct {
 	TailscaleOAuthClientSecret  string              `json:"tailscale_oauth_client_secret,omitempty"`
 
 	logger         *zap.Logger
+	tlc            tailscale.LocalClient
 	tc             *tailscale.Client
 	needGroup      bool
 	mu             sync.RWMutex
@@ -100,7 +101,7 @@ func (ta *TailscaleAuth) Provision(ctx caddy.Context) error {
 		if tailnet == "" {
 			tailnet = ta.ExpectedTailnet
 		}
-		var oauthConfig = &clientcredentials.Config{
+		oauthConfig := &clientcredentials.Config{
 			ClientID:     ta.TailscaleOAuthClientID,
 			ClientSecret: ta.TailscaleOAuthClientSecret,
 			TokenURL:     "https://api.tailscale.com/api/v2/oauth/token",
@@ -170,7 +171,7 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 		return caddyauth.User{}, false, fmt.Errorf("remote address and port are not valid: %w", err)
 	}
 
-	info, err := tailscale.WhoIs(r.Context(), remoteAddr.String())
+	info, err := ta.tlc.WhoIs(r.Context(), remoteAddr.String())
 	if err != nil {
 		return caddyauth.User{}, false, fmt.Errorf("tailscale whois failed: %w", err)
 	}
@@ -187,7 +188,9 @@ func (ta *TailscaleAuth) Authenticate(w http.ResponseWriter, r *http.Request) (c
 	}
 
 	if ta.ExpectedTailnet != "" && ta.ExpectedTailnet != tailnet {
-		ta.logger.Warn("user is part of unexpected tailnet", zap.String("expected_tailnet", ta.ExpectedTailnet), zap.String("unexpected_tailnet", tailnet))
+		ta.logger.Warn("user is part of unexpected tailnet",
+			zap.String("expected_tailnet", ta.ExpectedTailnet),
+			zap.String("unexpected_tailnet", tailnet))
 		return caddyauth.User{}, false, nil
 	}
 
@@ -348,7 +351,7 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	}, nil
 }
 
-func parseSimpleValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+func parseSimpleValue(d *caddyfile.Dispenser, _ any) (any, error) {
 	replacer := caddy.NewReplacer()
 	d.Next() // consume parameter name
 	if !d.Next() {
@@ -361,7 +364,7 @@ func parseSimpleValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error
 	return val, nil
 }
 
-func parseDurationValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+func parseDurationValue(d *caddyfile.Dispenser, _ any) (any, error) {
 	replacer := caddy.NewReplacer()
 	d.Next() // consume parameter name
 	if !d.Next() {
@@ -373,12 +376,12 @@ func parseDurationValue(d *caddyfile.Dispenser, _ interface{}) (interface{}, err
 	}
 	dur, err := time.ParseDuration(val)
 	if err != nil {
-		return "", d.Errf("%q is not a valid duration: %s", err)
+		return "", d.Errf("%q is not a valid duration: %s", val, err)
 	}
 	return dur, nil
 }
 
-func parseGroups(d *caddyfile.Dispenser, _ interface{}) (interface{}, error) {
+func parseGroups(d *caddyfile.Dispenser, _ any) (any, error) {
 	groups := make(map[string][]string)
 	for d.Next() {
 		for d.NextBlock(0) {
